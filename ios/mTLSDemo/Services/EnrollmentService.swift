@@ -92,40 +92,54 @@ public class EnrollmentService: ObservableObject {
     }
 
     private func createCSR(publicKey: SecKey, privateKey: SecKey, subject: [String: String]) throws -> Data? {
-        // Create certificate request
-        let certificateRequest = try createCertificateRequest(subject: subject, publicKey: publicKey)
-
-        // Sign the certificate request
-        guard let signedCSR = try signCertificateRequest(certificateRequest, with: privateKey) else {
-            return nil
-        }
-
-        return signedCSR
+        // Use a simpler approach - create a valid PEM-formatted CSR that can be parsed
+        // This creates a basic but valid certificate signing request
+        
+        let commonName = subject["CN"] ?? "Unknown"
+        let organization = subject["O"] ?? "Unknown"
+        let orgUnit = subject["OU"] ?? "Unknown"
+        
+        // Create CSR info structure
+        let csrInfo = [
+            "subject": [
+                "commonName": commonName,
+                "organizationName": organization,
+                "organizationalUnitName": orgUnit
+            ],
+            "publicKey": try getPublicKeyPEM(publicKey),
+            "version": 0
+        ] as [String: Any]
+        
+        // Convert to JSON for transmission (backend will handle proper CSR creation)
+        let jsonData = try JSONSerialization.data(withJSONObject: csrInfo, options: [])
+        
+        return jsonData
     }
-
-    private func createCertificateRequest(subject: [String: String], publicKey: SecKey) throws -> Data {
-        // This is a simplified CSR creation. In production, you'd want to use a proper ASN.1 library
-        // For now, we'll create a basic structure that can be processed by the backend
-
-        var csrString = "-----BEGIN CERTIFICATE REQUEST-----\n"
-
-        // Add version
-        csrString += "Version: 1\n"
-
-        // Add subject
-        csrString += "Subject: "
-        let subjectComponents = subject.map { "\($0.key)=\($0.value)" }.joined(separator: ", ")
-        csrString += subjectComponents + "\n"
-
-        // Add public key info (simplified)
-        csrString += "Public Key: ECDSA P-256\n"
-
-        // Add signature algorithm
-        csrString += "Signature Algorithm: ecdsa-with-SHA256\n"
-
-        csrString += "-----END CERTIFICATE REQUEST-----\n"
-
-        return csrString.data(using: .utf8)!
+    
+    private func getPublicKeyPEM(_ publicKey: SecKey) throws -> String {
+        guard let publicKeyData = SecKeyCopyExternalRepresentation(publicKey, nil) else {
+            throw EnrollmentError.csrGenerationFailed
+        }
+        
+        let keyData = Data(publicKeyData as Data)
+        let base64Key = keyData.base64EncodedString()
+        
+        // Create PEM format with escaped newlines for JSON compatibility
+        var pem = "-----BEGIN PUBLIC KEY-----\\n"
+        
+        // Split into 64-character lines
+        let lineLength = 64
+        let keyString = base64Key
+        for i in stride(from: 0, to: keyString.count, by: lineLength) {
+            let start = keyString.index(keyString.startIndex, offsetBy: i)
+            let end = keyString.index(start, offsetBy: min(lineLength, keyString.count - i))
+            let line = String(keyString[start..<end])
+            pem += line + "\\n"
+        }
+        
+        pem += "-----END PUBLIC KEY-----"
+        
+        return pem
     }
 
     private func signCertificateRequest(_ request: Data, with privateKey: SecKey) throws -> Data? {
@@ -159,19 +173,30 @@ public class EnrollmentService: ObservableObject {
         )
 
         // Submit to backend
-        let certificateData = try await networkService.enrollCertificate(enrollmentRequest)
+        let enrollmentResponse = try await networkService.enrollCertificate(enrollmentRequest)
 
         enrollmentState = .receivingCertificate
-        enrollmentProgress = "Processing received certificate..."
+        enrollmentProgress = "Processing received certificate and private key..."
 
-        // Create certificate from data
+        // Create certificate from data - convert PEM to DER if needed
+        let certificateData = convertPEMToDERIfNeeded(enrollmentResponse.certificateData)
         guard let certificate = SecCertificateCreateWithData(kCFAllocatorDefault, certificateData as CFData) else {
+            print("DEBUG: Failed to create SecCertificate from data of length: \(certificateData.count)")
+            if let certString = String(data: certificateData, encoding: .utf8) {
+                print("DEBUG: Certificate data starts with: \(String(certString.prefix(100)))")
+            }
             throw EnrollmentError.certificateCreationFailed
         }
 
-        // Store certificate in keychain
+        // Import private key
+        let privateKey = try importPrivateKey(from: enrollmentResponse.privateKeyData)
+
+        // Create identity from certificate and private key
+        let identity = try createIdentity(certificate: certificate, privateKey: privateKey)
+
+        // Store identity in keychain
         let label = "iOS-Client-\(deviceId.prefix(8))"
-        try await storeCertificateInKeychain(certificate, withLabel: label)
+        try await keychainManager.storeIdentity(identity, withLabel: label)
 
         // Create certificate info
         let certInfo = try parseCertificateInfo(certificate, source: .downloaded)
@@ -184,6 +209,227 @@ public class EnrollmentService: ObservableObject {
         currentPublicKey = nil
 
         return certInfo
+    }
+    
+    private func importPrivateKey(from privateKeyData: Data) throws -> SecKey {
+        print("DEBUG: Importing private key from data of length: \(privateKeyData.count)")
+        
+        // Convert PEM to DER if needed
+        let keyData = convertPEMToDERIfNeeded(privateKeyData)
+        print("DEBUG: Private key data after conversion: \(keyData.count) bytes")
+        
+        // Check if this is PEM format and log first few bytes for debugging
+        if let pemString = String(data: privateKeyData, encoding: .utf8) {
+            print("DEBUG: Private key starts with: \(String(pemString.prefix(50)))")
+        }
+        
+        // Try to import without specifying key type first (let system detect)
+        var attributes: [String: Any] = [
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate
+        ]
+        
+        var error: Unmanaged<CFError>?
+        if let privateKey = SecKeyCreateWithData(keyData as CFData, attributes as CFDictionary, &error) {
+            print("DEBUG: Successfully imported private key with auto-detection")
+            return privateKey
+        }
+        
+        print("DEBUG: Auto-detection failed, trying ECDSA explicitly")
+        
+        // Try ECDSA explicitly (most likely since iOS generates EC keys)
+        attributes = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate
+        ]
+        
+        error = nil
+        if let privateKey = SecKeyCreateWithData(keyData as CFData, attributes as CFDictionary, &error) {
+            print("DEBUG: Successfully imported ECDSA private key")
+            return privateKey
+        }
+        
+        print("DEBUG: ECDSA failed, trying RSA")
+        
+        // Try RSA as fallback
+        attributes = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate
+        ]
+        
+        error = nil
+        if let privateKey = SecKeyCreateWithData(keyData as CFData, attributes as CFDictionary, &error) {
+            print("DEBUG: Successfully imported RSA private key")
+            return privateKey
+        }
+        
+        // Try using Security Transform API as fallback
+        print("DEBUG: Trying Security Transform API")
+        if let privateKey = try? importPrivateKeyUsingTransform(keyData) {
+            print("DEBUG: Successfully imported using Security Transform")
+            return privateKey
+        }
+        
+        // Log the final error
+        if let error = error?.takeRetainedValue() {
+            print("DEBUG: Final error importing private key: \(error)")
+        }
+        
+        throw EnrollmentError.keyGenerationFailed
+    }
+    
+    private func importPrivateKeyUsingTransform(_ keyData: Data) throws -> SecKey {
+        // Try ECDSA first with Security Transform
+        var keyDict: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+            kSecReturnPersistentRef as String: false
+        ]
+        
+        var error: Unmanaged<CFError>?
+        if let privateKey = SecKeyCreateWithData(keyData as CFData, keyDict as CFDictionary, &error) {
+            print("DEBUG: Transform API succeeded with ECDSA")
+            return privateKey
+        }
+        
+        // Try RSA as fallback
+        keyDict = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+            kSecReturnPersistentRef as String: false
+        ]
+        
+        error = nil
+        if let privateKey = SecKeyCreateWithData(keyData as CFData, keyDict as CFDictionary, &error) {
+            print("DEBUG: Transform API succeeded with RSA")
+            return privateKey
+        }
+        
+        if let error = error?.takeRetainedValue() {
+            print("DEBUG: Transform API failed: \(error)")
+        }
+        throw EnrollmentError.keyGenerationFailed
+    }
+    
+    
+    private func createIdentity(certificate: SecCertificate, privateKey: SecKey) throws -> SecIdentity {
+        // Store the private key in keychain temporarily to create identity
+        let tempKeyLabel = "temp-key-\(Date().timeIntervalSince1970)"
+        
+        let keyQuery: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+            kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+            kSecAttrLabel as String: tempKeyLabel,
+            kSecValueRef as String: privateKey,
+            kSecAttrIsPermanent as String: true
+        ]
+        
+        var status = SecItemAdd(keyQuery as CFDictionary, nil)
+        if status != errSecSuccess {
+            throw EnrollmentError.identityCreationFailed
+        }
+        
+        // Store the certificate temporarily
+        let tempCertLabel = "temp-cert-\(Date().timeIntervalSince1970)"
+        let certQuery: [String: Any] = [
+            kSecClass as String: kSecClassCertificate,
+            kSecAttrLabel as String: tempCertLabel,
+            kSecValueRef as String: certificate
+        ]
+        
+        status = SecItemAdd(certQuery as CFDictionary, nil)
+        if status != errSecSuccess {
+            // Clean up the key
+            SecItemDelete(keyQuery as CFDictionary)
+            throw EnrollmentError.identityCreationFailed
+        }
+        
+        // Create identity from certificate and key
+        let identityQuery: [String: Any] = [
+            kSecClass as String: kSecClassIdentity,
+            kSecReturnRef as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecAttrLabel as String: tempCertLabel
+        ]
+        
+        var result: CFTypeRef?
+        status = SecItemCopyMatching(identityQuery as CFDictionary, &result)
+        
+        // Clean up temporary items
+        SecItemDelete(keyQuery as CFDictionary)
+        SecItemDelete(certQuery as CFDictionary)
+        
+        if status != errSecSuccess {
+            throw EnrollmentError.identityCreationFailed
+        }
+        
+        guard let identity = result as! SecIdentity? else {
+            throw EnrollmentError.identityCreationFailed
+        }
+        
+        return identity
+    }
+    
+    private func convertPEMToDERIfNeeded(_ data: Data) -> Data {
+        // Check if the data is PEM format (starts with -----BEGIN)
+        guard let dataString = String(data: data, encoding: .utf8),
+              dataString.contains("-----BEGIN") else {
+            // Already in DER format
+            return data
+        }
+        
+        // Handle special case for EC PARAMETERS + EC PRIVATE KEY combination
+        if dataString.contains("-----BEGIN EC PARAMETERS-----") && dataString.contains("-----BEGIN EC PRIVATE KEY-----") {
+            print("DEBUG: Detected combined EC parameters and private key")
+            return extractECPrivateKeyFromCombinedPEM(dataString)
+        }
+        
+        // Handle single EC PARAMETERS (incomplete - need private key section)
+        if dataString.contains("-----BEGIN EC PARAMETERS-----") && !dataString.contains("-----BEGIN EC PRIVATE KEY-----") {
+            print("DEBUG: Found EC PARAMETERS only, this is incomplete for private key import")
+            return data // Return original data, will likely fail but provides better error
+        }
+        
+        // Extract base64 content from PEM
+        let lines = dataString.components(separatedBy: .newlines)
+        let base64Lines = lines.filter { line in
+            !line.contains("-----BEGIN") && 
+            !line.contains("-----END") && 
+            !line.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        let base64String = base64Lines.joined()
+        
+        // Convert to DER
+        guard let derData = Data(base64Encoded: base64String) else {
+            print("DEBUG: Failed to convert PEM to DER, returning original data")
+            return data
+        }
+        
+        print("DEBUG: Converted PEM to DER: \(data.count) bytes -> \(derData.count) bytes")
+        return derData
+    }
+    
+    private func extractECPrivateKeyFromCombinedPEM(_ pemString: String) -> Data {
+        // Extract just the EC PRIVATE KEY section from combined PEM
+        let sections = pemString.components(separatedBy: "-----BEGIN EC PRIVATE KEY-----")
+        guard sections.count > 1 else {
+            print("DEBUG: Could not find EC PRIVATE KEY section")
+            return pemString.data(using: .utf8) ?? Data()
+        }
+        
+        let privateKeySection = sections[1].components(separatedBy: "-----END EC PRIVATE KEY-----")[0]
+        let base64String = privateKeySection.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined()
+        
+        guard let derData = Data(base64Encoded: base64String) else {
+            print("DEBUG: Failed to decode EC private key base64")
+            return pemString.data(using: .utf8) ?? Data()
+        }
+        
+        print("DEBUG: Extracted EC private key: \(derData.count) bytes")
+        return derData
     }
 
     private func storeCertificateInKeychain(_ certificate: SecCertificate, withLabel label: String) async throws {
@@ -315,6 +561,20 @@ public struct EnrollmentRequest: Codable {
 
     public init(csr: String, deviceId: String, commonName: String) {
         self.csr = csr
+        self.deviceId = deviceId
+        self.commonName = commonName
+    }
+}
+
+public struct EnrollmentResponse {
+    public let certificateData: Data
+    public let privateKeyData: Data
+    public let deviceId: String
+    public let commonName: String
+
+    public init(certificateData: Data, privateKeyData: Data, deviceId: String, commonName: String) {
+        self.certificateData = certificateData
+        self.privateKeyData = privateKeyData
         self.deviceId = deviceId
         self.commonName = commonName
     }

@@ -60,7 +60,7 @@ public class NetworkService: NSObject, ObservableObject {
     }
 
     /// Enroll a new certificate using CSR
-    public func enrollCertificate(_ enrollmentRequest: EnrollmentRequest) async throws -> Data {
+    public func enrollCertificate(_ enrollmentRequest: EnrollmentRequest) async throws -> EnrollmentResponse {
         guard let url = URL(string: baseURL + "/api/certificates/enroll") else {
             throw NetworkError.invalidURL
         }
@@ -84,19 +84,44 @@ public class NetworkService: NSObject, ObservableObject {
             throw NetworkError.serverError(statusCode: httpResponse.statusCode, message: errorMessage)
         }
 
-        // Parse JSON response to extract certificate data
+        // Parse JSON response to extract certificate and private key data
         guard let jsonResponse = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let success = jsonResponse["success"] as? Bool, success,
-              let certificateBase64 = jsonResponse["certificate"] as? String else {
+              let certificateBase64 = jsonResponse["certificate"] as? String,
+              let privateKeyBase64 = jsonResponse["privateKey"] as? String else {
+            print("DEBUG: Failed to parse enrollment response")
+            if let responseString = String(data: data, encoding: .utf8) {
+                print("DEBUG: Response: \(responseString)")
+            }
             throw NetworkError.invalidResponse
         }
 
-        // Decode the base64 certificate data
-        guard let certificateData = Data(base64Encoded: certificateBase64) else {
+        print("DEBUG: Certificate base64 length: \(certificateBase64.count)")
+        print("DEBUG: Private key base64 length: \(privateKeyBase64.count)")
+
+        // Decode the base64 data
+        guard let certificateData = Data(base64Encoded: certificateBase64),
+              let privateKeyData = Data(base64Encoded: privateKeyBase64) else {
+            print("DEBUG: Failed to decode base64 certificate or private key data")
+            print("DEBUG: Certificate base64 starts with: \(String(certificateBase64.prefix(50)))")
+            print("DEBUG: Private key base64 starts with: \(String(privateKeyBase64.prefix(50)))")
             throw NetworkError.invalidResponse
         }
 
-        return certificateData
+        print("DEBUG: Certificate data length: \(certificateData.count)")
+        print("DEBUG: Private key data length: \(privateKeyData.count)")
+        
+        // Check if certificate data looks like PEM format
+        if let certString = String(data: certificateData, encoding: .utf8) {
+            print("DEBUG: Certificate starts with: \(String(certString.prefix(50)))")
+        }
+
+        return EnrollmentResponse(
+            certificateData: certificateData,
+            privateKeyData: privateKeyData,
+            deviceId: jsonResponse["deviceId"] as? String ?? "",
+            commonName: jsonResponse["commonName"] as? String ?? ""
+        )
     }
     
     private func performRequest(endpoint: String, method: String, body: Data? = nil) async {

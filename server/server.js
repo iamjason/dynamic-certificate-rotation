@@ -172,61 +172,126 @@ app.post('/api/certificates/enroll', (req, res) => {
     console.log(`📝 Certificate enrollment request from device: ${deviceId}`);
     console.log(`📝 Common name: ${commonName}`);
 
-    // Decode the CSR from base64
-    const csrData = Buffer.from(csr, 'base64');
+    // Parse CSR - handle both JSON format and traditional base64 CSR
+    let csrInfo;
+    try {
+      // Try to parse as JSON first (new format)
+      const decodedCSR = Buffer.from(csr, 'base64').toString();
+      console.log('📝 Decoded CSR data:', decodedCSR.substring(0, 200) + '...');
+      
+      const csrJson = JSON.parse(decodedCSR);
+      csrInfo = csrJson;
+      console.log('📝 Received JSON-based CSR request');
+      console.log('📝 CSR Info:', JSON.stringify(csrInfo, null, 2));
+    } catch (parseError) {
+      console.log('📝 JSON parsing failed:', parseError.message);
+      // Fall back to traditional CSR format
+      const csrData = Buffer.from(csr, 'base64');
+      
+      // Save CSR to temporary file for traditional processing
+      const csrFile = path.join(CERTS_DIR, `csr-${deviceId}-${Date.now()}.csr`);
+      fs.writeFileSync(csrFile, csrData);
+      
+      console.log('📝 Received traditional ASN.1 CSR');
+      return handleTraditionalCSR(csrFile, deviceId, commonName, res);
+    }
 
-    // Save CSR to temporary file
-    const csrFile = path.join(CERTS_DIR, `csr-${deviceId}-${Date.now()}.csr`);
-    fs.writeFileSync(csrFile, csrData);
-
-    // Generate certificate using OpenSSL
+    // Handle JSON-based CSR by generating certificate directly
     const certFile = path.join(CERTS_DIR, `client-${deviceId}-${Date.now()}.pem`);
-    const serialFile = path.join(PKI_DIR, 'certs', 'ca-cert.srl');
+    const keyFile = path.join(PRIVATE_DIR, `client-${deviceId}-${Date.now()}.key`);
+    const configFile = path.join(CERTS_DIR, `client-${deviceId}-${Date.now()}.conf`);
 
     try {
-      // Create certificate signing command
+      // Create a temporary OpenSSL config for the certificate
+      const opensslConfig = `
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+CN = ${csrInfo.subject.commonName}
+O = ${csrInfo.subject.organizationName}
+OU = ${csrInfo.subject.organizationalUnitName}
+
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment
+extendedKeyUsage = clientAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = ${csrInfo.subject.commonName}
+      `.trim();
+
+      fs.writeFileSync(configFile, opensslConfig);
+
+      // Generate an ECDSA private key for the client (P-256 to match iOS)
+      const genKeyCommand = `openssl ecparam -genkey -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -out "${keyFile}"`;
+      console.log('🔐 Generating ECDSA P-256 client private key in PKCS#8 format...');
+      execSync(genKeyCommand, { stdio: 'inherit' });
+
+      // Generate CSR first, then sign it
+      const csrTempFile = path.join(CERTS_DIR, `temp-${deviceId}-${Date.now()}.csr`);
+      
+      const genCSRCommand = [
+        'openssl req -new',
+        `-key "${keyFile}"`,
+        `-out "${csrTempFile}"`,
+        `-config "${configFile}"`
+      ].join(' ');
+
+      console.log('🔐 Generating CSR from config...');
+      execSync(genCSRCommand, { stdio: 'inherit' });
+
+      // Sign the CSR with CA
       const signCommand = [
         'openssl x509 -req',
-        `-in "${csrFile}"`,
+        `-in "${csrTempFile}"`,
         `-CA "${path.join(CERTS_DIR, 'ca-cert.pem')}"`,
         `-CAkey "${path.join(PRIVATE_DIR, 'ca-key.pem')}"`,
         `-out "${certFile}"`,
         '-days 365',
         '-sha256',
-        `-CAserial "${serialFile}"`,
-        '-CAcreateserial'
+        `-CAcreateserial`
       ].join(' ');
 
-      console.log('🔐 Executing certificate signing command...');
+      console.log('🔐 Signing certificate...');
       execSync(signCommand, { stdio: 'inherit' });
 
       // Read the signed certificate
       const signedCert = fs.readFileSync(certFile);
+      const clientKey = fs.readFileSync(keyFile);
 
       // Clean up temporary files
-      fs.unlinkSync(csrFile);
+      fs.unlinkSync(csrTempFile);
       fs.unlinkSync(certFile);
+      fs.unlinkSync(keyFile);
+      fs.unlinkSync(configFile);
 
       console.log(`✅ Certificate enrolled successfully for device: ${deviceId}`);
 
-      // Return the signed certificate
+      // Return the signed certificate and private key
       res.json({
         success: true,
         certificate: signedCert.toString('base64'),
+        privateKey: clientKey.toString('base64'),
         deviceId: deviceId,
         commonName: commonName,
         validFor: '365 days'
       });
 
     } catch (signError) {
-      console.error('❌ Certificate signing failed:', signError.message);
+      console.error('❌ Certificate generation failed:', signError.message);
 
       // Clean up temporary files
-      if (fs.existsSync(csrFile)) fs.unlinkSync(csrFile);
       if (fs.existsSync(certFile)) fs.unlinkSync(certFile);
+      if (fs.existsSync(keyFile)) fs.unlinkSync(keyFile);
+      if (fs.existsSync(configFile)) fs.unlinkSync(configFile);
+      const csrTempFile = path.join(CERTS_DIR, `temp-${deviceId}-${Date.now()}.csr`);
+      if (fs.existsSync(csrTempFile)) fs.unlinkSync(csrTempFile);
 
       return res.status(500).json({
-        error: 'Certificate signing failed',
+        error: 'Certificate generation failed',
         details: signError.message
       });
     }
@@ -238,6 +303,55 @@ app.post('/api/certificates/enroll', (req, res) => {
     });
   }
 });
+
+function handleTraditionalCSR(csrFile, deviceId, commonName, res) {
+  // Original CSR processing logic
+  const certFile = path.join(CERTS_DIR, `client-${deviceId}-${Date.now()}.pem`);
+  const serialFile = path.join(PKI_DIR, 'certs', 'ca-cert.srl');
+
+  try {
+    const signCommand = [
+      'openssl x509 -req',
+      `-in "${csrFile}"`,
+      `-CA "${path.join(CERTS_DIR, 'ca-cert.pem')}"`,
+      `-CAkey "${path.join(PRIVATE_DIR, 'ca-key.pem')}"`,
+      `-out "${certFile}"`,
+      '-days 365',
+      '-sha256',
+      `-CAserial "${serialFile}"`,
+      '-CAcreateserial'
+    ].join(' ');
+
+    console.log('🔐 Executing certificate signing command...');
+    execSync(signCommand, { stdio: 'inherit' });
+
+    const signedCert = fs.readFileSync(certFile);
+
+    fs.unlinkSync(csrFile);
+    fs.unlinkSync(certFile);
+
+    console.log(`✅ Certificate enrolled successfully for device: ${deviceId}`);
+
+    res.json({
+      success: true,
+      certificate: signedCert.toString('base64'),
+      deviceId: deviceId,
+      commonName: commonName,
+      validFor: '365 days'
+    });
+
+  } catch (signError) {
+    console.error('❌ Certificate signing failed:', signError.message);
+
+    if (fs.existsSync(csrFile)) fs.unlinkSync(csrFile);
+    if (fs.existsSync(certFile)) fs.unlinkSync(certFile);
+
+    return res.status(500).json({
+      error: 'Certificate signing failed',
+      details: signError.message
+    });
+  }
+}
 
 app.use((err, req, res, next) => {
   console.error('Server error:', err.message);
