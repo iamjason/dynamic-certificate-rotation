@@ -27,9 +27,11 @@ public class NetworkService: NSObject, ObservableObject {
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 60
         
+        // Initialize with placeholder first
         self.urlSession = URLSession(configuration: configuration)
         super.init()
         
+        // Replace with properly configured session with delegate
         self.urlSession = URLSession(
             configuration: configuration,
             delegate: self,
@@ -75,6 +77,7 @@ public class NetworkService: NSObject, ObservableObject {
         }
         
         do {
+            print("DEBUG: Starting URLSession request to: \(request.url?.absoluteString ?? "unknown")")
             let (data, response) = try await urlSession.data(for: request)
             
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -105,22 +108,37 @@ public class NetworkService: NSObject, ObservableObject {
 }
 
 extension NetworkService: URLSessionDelegate {
-    public func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+    nonisolated public func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        
+        print("DEBUG: *** URLSessionDelegate challenge received ***")
+        print("DEBUG: Authentication method: \(challenge.protectionSpace.authenticationMethod)")
+        print("DEBUG: Challenge host: \(challenge.protectionSpace.host)")
         
         Task {
-            guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust else {
-                completionHandler(.performDefaultHandling, nil)
-                return
-            }
-            
-            if await validateServerTrust(challenge.protectionSpace.serverTrust) {
-                let credential = URLCredential(trust: challenge.protectionSpace.serverTrust!)
-                completionHandler(.useCredential, credential)
-            } else {
-                await MainActor.run {
-                    self.error = "Server certificate validation failed - CA pinning rejected connection"
+            switch challenge.protectionSpace.authenticationMethod {
+            case NSURLAuthenticationMethodServerTrust:
+                print("DEBUG: Handling server trust challenge")
+                if await validateServerTrust(challenge.protectionSpace.serverTrust) {
+                    let credential = URLCredential(trust: challenge.protectionSpace.serverTrust!)
+                    completionHandler(.useCredential, credential)
+                } else {
+                    completionHandler(.rejectProtectionSpace, nil)
                 }
-                completionHandler(.rejectProtectionSpace, nil)
+                
+            case NSURLAuthenticationMethodClientCertificate:
+                print("DEBUG: Handling client certificate challenge at session level")
+                if let identity = await CertificateManager.shared.getCurrentIdentity() {
+                    print("DEBUG: Client certificate identity found at session level - providing credential")
+                    let credential = URLCredential(identity: identity, certificates: nil, persistence: .forSession)
+                    completionHandler(.useCredential, credential)
+                } else {
+                    print("DEBUG: No client certificate identity available at session level")
+                    completionHandler(.rejectProtectionSpace, nil)
+                }
+                
+            default:
+                print("DEBUG: Unknown challenge method: \(challenge.protectionSpace.authenticationMethod)")
+                completionHandler(.performDefaultHandling, nil)
             }
         }
     }
@@ -136,28 +154,42 @@ extension NetworkService: URLSessionDelegate {
 }
 
 extension NetworkService: URLSessionTaskDelegate {
-    public func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+    nonisolated public func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         
-        print("DEBUG: URLSessionTaskDelegate challenge received")
+        print("DEBUG: *** URLSessionTaskDelegate challenge received ***")
         print("DEBUG: Authentication method: \(challenge.protectionSpace.authenticationMethod)")
+        print("DEBUG: URL: \(task.originalRequest?.url?.absoluteString ?? "unknown")")
+        print("DEBUG: Challenge host: \(challenge.protectionSpace.host)")
+        print("DEBUG: All challenge methods available: \(challenge.protectionSpace)")
+        
+        // Log all available authentication methods for debugging
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust {
+            print("DEBUG: This is a server trust challenge")
+        }
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodClientCertificate {
+            print("DEBUG: This is a client certificate challenge")
+        }
         
         Task {
-            if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodClientCertificate {
-                print("DEBUG: Client certificate challenge detected")
+            switch challenge.protectionSpace.authenticationMethod {
+            case NSURLAuthenticationMethodClientCertificate:
+                print("DEBUG: Client certificate challenge detected at task level")
                 
                 if let identity = await CertificateManager.shared.getCurrentIdentity() {
-                    print("DEBUG: Client certificate identity found - providing credential")
+                    print("DEBUG: Client certificate identity found at task level - providing credential")
                     let credential = URLCredential(identity: identity, certificates: nil, persistence: .forSession)
                     completionHandler(.useCredential, credential)
                 } else {
-                    print("DEBUG: No client certificate identity available")
-                    await MainActor.run {
-                        self.error = "No client certificate available for mTLS authentication"
-                    }
+                    print("DEBUG: No client certificate identity available at task level")
                     completionHandler(.rejectProtectionSpace, nil)
                 }
-            } else {
-                print("DEBUG: Non-client certificate challenge - using default handling")
+                
+            case NSURLAuthenticationMethodServerTrust:
+                print("DEBUG: Server trust challenge at task level - using default handling")
+                completionHandler(.performDefaultHandling, nil)
+                
+            default:
+                print("DEBUG: Unknown challenge method at task level: \(challenge.protectionSpace.authenticationMethod)")
                 completionHandler(.performDefaultHandling, nil)
             }
         }

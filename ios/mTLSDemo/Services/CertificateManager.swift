@@ -22,7 +22,10 @@ public class CertificateManager: ObservableObject {
     
     private init() {
         Task {
+            print("DEBUG: CertificateManager initializing...")
             await loadCertificates()
+            print("DEBUG: CertificateManager initialization complete. Certificates loaded: \(certificates.count)")
+            print("DEBUG: Current certificate: \(currentCertificate?.commonName ?? "none")")
         }
     }
     
@@ -55,14 +58,31 @@ public class CertificateManager: ObservableObject {
         let certNames = ["ios-client-v1", "ios-client-v2"]
         
         for certName in certNames {
-            if let p12Data = loadP12FromBundle(named: certName),
-               let identity = try? extractIdentityFromP12(p12Data, password: "demo123"),
-               let certificate = try? extractCertificateFromIdentity(identity),
-               let certInfo = try? parseCertificateInfo(certificate, source: .bundle) {
+            print("DEBUG: Loading bundled certificate: \(certName)")
+            
+            guard let p12Data = loadP12FromBundle(named: certName) else {
+                print("DEBUG: Failed to load P12 data for \(certName)")
+                continue
+            }
+            print("DEBUG: P12 data loaded for \(certName), size: \(p12Data.count) bytes")
+            
+            do {
+                let identity = try extractIdentityFromP12(p12Data, password: "demo123")
+                print("DEBUG: Identity extracted for \(certName)")
+                
+                let certificate = try extractCertificateFromIdentity(identity)
+                print("DEBUG: Certificate extracted for \(certName)")
+                
+                let certInfo = try parseCertificateInfo(certificate, source: .bundle)
+                print("DEBUG: Certificate info parsed for \(certName): \(certInfo.commonName)")
+                
                 bundledCerts.append(certInfo)
+            } catch {
+                print("DEBUG: Error processing \(certName): \(error)")
             }
         }
         
+        print("DEBUG: Loaded \(bundledCerts.count) bundled certificates")
         return bundledCerts
     }
     
@@ -82,13 +102,40 @@ public class CertificateManager: ObservableObject {
     }
     
     private func loadP12FromBundle(named name: String) -> Data? {
+        print("DEBUG: Looking for P12 file: \(name).p12")
+        
         guard let url = Bundle.main.url(forResource: name, withExtension: "p12") else {
+            print("DEBUG: P12 file not found in bundle: \(name).p12")
+            
+            // List all resources in bundle for debugging
+            if let resourcePath = Bundle.main.resourcePath {
+                print("DEBUG: Bundle resource path: \(resourcePath)")
+                do {
+                    let contents = try FileManager.default.contentsOfDirectory(atPath: resourcePath)
+                    print("DEBUG: Bundle contents: \(contents)")
+                } catch {
+                    print("DEBUG: Error listing bundle contents: \(error)")
+                }
+            }
+            
             return nil
         }
-        return try? Data(contentsOf: url)
+        
+        print("DEBUG: Found P12 URL: \(url)")
+        
+        do {
+            let data = try Data(contentsOf: url)
+            print("DEBUG: P12 data loaded successfully, size: \(data.count) bytes")
+            return data
+        } catch {
+            print("DEBUG: Error loading P12 data: \(error)")
+            return nil
+        }
     }
     
     private func extractIdentityFromP12(_ p12Data: Data, password: String) throws -> SecIdentity {
+        print("DEBUG: Extracting identity from P12, data size: \(p12Data.count), password: \(password)")
+        
         let options: [String: Any] = [
             kSecImportExportPassphrase as String: password
         ]
@@ -96,17 +143,39 @@ public class CertificateManager: ObservableObject {
         var items: CFArray?
         let status = SecPKCS12Import(p12Data as CFData, options as CFDictionary, &items)
         
-        guard status == errSecSuccess,
-              let itemsArray = items as? [[String: Any]],
-              let firstItem = itemsArray.first,
-              let identityRef = firstItem[kSecImportItemIdentity as String] else {
+        print("DEBUG: SecPKCS12Import status: \(status)")
+        
+        if status != errSecSuccess {
+            let errorString = SecCopyErrorMessageString(status, nil) as String? ?? "Unknown error"
+            print("DEBUG: SecPKCS12Import failed: \(errorString)")
+            throw CertificateError.invalidP12Data
+        }
+        
+        guard let itemsArray = items as? [[String: Any]] else {
+            print("DEBUG: Failed to cast items to array")
+            throw CertificateError.invalidP12Data
+        }
+        
+        print("DEBUG: P12 import returned \(itemsArray.count) items")
+        
+        guard let firstItem = itemsArray.first else {
+            print("DEBUG: No items in P12 import result")
+            throw CertificateError.invalidP12Data
+        }
+        
+        print("DEBUG: First item keys: \(firstItem.keys)")
+        
+        guard let identityRef = firstItem[kSecImportItemIdentity as String] else {
+            print("DEBUG: No identity found in P12 import result")
             throw CertificateError.invalidP12Data
         }
         
         guard CFGetTypeID(identityRef as CFTypeRef) == SecIdentityGetTypeID() else {
+            print("DEBUG: Invalid identity type")
             throw CertificateError.invalidP12Data
         }
         
+        print("DEBUG: Successfully extracted identity from P12")
         return (identityRef as! SecIdentity)
     }
     
@@ -190,26 +259,40 @@ public class CertificateManager: ObservableObject {
         
         print("DEBUG: Current certificate: \(currentCert.commonName) from \(currentCert.source)")
         
+        // Always try to get identity from Keychain first (proper mTLS approach)
+        print("DEBUG: Loading identity from keychain for: \(currentCert.commonName)")
+        if let identity = try? await keychainManager.retrieveIdentity(withLabel: currentCert.commonName) {
+            print("DEBUG: Identity successfully retrieved from keychain")
+            return identity
+        } else {
+            print("DEBUG: Identity not found in keychain, attempting to install from bundle")
+        }
+        
+        // If not in keychain, try to install from bundle P12
         if currentCert.source == .bundle {
-            print("DEBUG: Loading P12 from bundle for: \(currentCert.commonName)")
+            print("DEBUG: Installing P12 from bundle to keychain for: \(currentCert.commonName)")
             if let p12Data = loadP12FromBundle(named: currentCert.commonName) {
                 print("DEBUG: P12 data loaded, size: \(p12Data.count) bytes")
-                if let identity = try? extractIdentityFromP12(p12Data, password: "demo123") {
-                    print("DEBUG: Identity successfully extracted from P12")
-                    return identity
-                } else {
-                    print("DEBUG: Failed to extract identity from P12")
+                do {
+                    let identity = try extractIdentityFromP12(p12Data, password: "demo123")
+                    print("DEBUG: Identity extracted from P12, installing to keychain")
+                    
+                    // Install identity to keychain
+                    try await keychainManager.storeIdentity(identity, withLabel: currentCert.commonName)
+                    print("DEBUG: Identity successfully installed to keychain")
+                    
+                    // Now retrieve it from keychain
+                    if let keychainIdentity = try? await keychainManager.retrieveIdentity(withLabel: currentCert.commonName) {
+                        print("DEBUG: Identity successfully retrieved from keychain after installation")
+                        return keychainIdentity
+                    } else {
+                        print("DEBUG: Failed to retrieve identity from keychain after installation")
+                    }
+                } catch {
+                    print("DEBUG: Failed to extract or install identity: \(error)")
                 }
             } else {
                 print("DEBUG: Failed to load P12 from bundle")
-            }
-        } else {
-            print("DEBUG: Loading identity from keychain for: \(currentCert.commonName)")
-            if let identity = try? await keychainManager.retrieveIdentity(withLabel: currentCert.commonName) {
-                print("DEBUG: Identity successfully retrieved from keychain")
-                return identity
-            } else {
-                print("DEBUG: Failed to retrieve identity from keychain")
             }
         }
         
