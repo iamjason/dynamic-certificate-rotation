@@ -10,7 +10,9 @@ import SwiftUI
 struct CertificatesView: View {
     @StateObject private var certificateManager = CertificateManager.shared
     @StateObject private var rotationService = CertificateRotationService.shared
+    @StateObject private var enrollmentService = EnrollmentService.shared
     @State private var showingCleanupAlert = false
+    @State private var showingEnrollAlert = false
     
     var body: some View {
         NavigationView {
@@ -22,9 +24,11 @@ struct CertificatesView: View {
                     ScrollView {
                         LazyVStack(spacing: 16) {
                             currentCertificateSection
-                            
+
                             rotationStatusSection
-                            
+
+                            enrollmentStatusSection
+
                             certificateListSection
                             
                             actionButtonsSection
@@ -49,10 +53,33 @@ struct CertificatesView: View {
             } message: {
                 Text("This will remove all expired certificates from the keychain. This action cannot be undone.")
             }
+            .alert("Enroll New Certificate", isPresented: $showingEnrollAlert) {
+                Button("Cancel", role: .cancel) { }
+                Button("Enroll") {
+                    Task {
+                        await performEnrollment()
+                    }
+                }
+            } message: {
+                Text("This will generate a new keypair in the Secure Enclave and request a certificate from the server. The private key will never leave the device.")
+            }
         }
         .task {
             await certificateManager.loadCertificates()
             await rotationService.checkRotationNeeded()
+            enrollmentService.resetEnrollment()
+        }
+    }
+
+    private func performEnrollment() async {
+        do {
+            let certificateInfo = try await certificateManager.enrollCertificate()
+            // Enrollment successful, refresh the certificate list
+            await certificateManager.loadCertificates()
+            await rotationService.checkRotationNeeded()
+        } catch {
+            // Error is already handled by the enrollment service and displayed in the UI
+            print("Enrollment failed: \(error)")
         }
     }
     
@@ -127,7 +154,82 @@ struct CertificatesView: View {
             .cornerRadius(12)
         }
     }
-    
+
+    private var enrollmentStatusSection: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Image(systemName: "plus.circle.fill")
+                    .foregroundColor(.green)
+                Text("Certificate Enrollment")
+                    .font(.headline)
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                // Enrollment status
+                HStack {
+                    Text("Status:")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text(enrollmentService.enrollmentState.displayText)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundColor(enrollmentStatusColor)
+                }
+
+                // Progress indicator if active
+                if enrollmentService.enrollmentState.isActive {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ProgressView(value: enrollmentProgressValue, total: 1.0)
+                            .progressViewStyle(.linear)
+
+                        Text(enrollmentService.enrollmentProgress)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                // Error display
+                if let error = enrollmentService.enrollmentError {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.red)
+                            .font(.caption)
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.red)
+                            .lineLimit(nil)
+                        Spacer()
+                    }
+                    .padding(8)
+                    .background(Color.red.opacity(0.1))
+                    .cornerRadius(8)
+                }
+
+                // Enroll button
+                if !enrollmentService.enrollmentState.isActive {
+                    Button(action: {
+                        showingEnrollAlert = true
+                    }) {
+                        HStack {
+                            Image(systemName: "plus.circle")
+                            Text("Request New Certificate")
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(Color.green.opacity(0.1))
+                        .foregroundColor(.green)
+                        .cornerRadius(8)
+                    }
+                }
+            }
+            .padding()
+            .background(Color.gray.opacity(0.1))
+            .cornerRadius(12)
+        }
+    }
+
     private var certificateListSection: some View {
         VStack(spacing: 12) {
             HStack {
@@ -209,6 +311,40 @@ struct CertificatesView: View {
             return .orange
         } else {
             return .green
+        }
+    }
+
+    private var enrollmentStatusColor: Color {
+        switch enrollmentService.enrollmentState {
+        case .idle:
+            return .gray
+        case .starting, .generatingKeys, .generatingCSR, .submittingCSR, .receivingCertificate:
+            return .blue
+        case .completed:
+            return .green
+        case .failed:
+            return .red
+        }
+    }
+
+    private var enrollmentProgressValue: Double {
+        switch enrollmentService.enrollmentState {
+        case .idle:
+            return 0.0
+        case .starting:
+            return 0.1
+        case .generatingKeys:
+            return 0.3
+        case .generatingCSR:
+            return 0.5
+        case .submittingCSR:
+            return 0.7
+        case .receivingCertificate:
+            return 0.9
+        case .completed:
+            return 1.0
+        case .failed:
+            return 0.0
         }
     }
 }

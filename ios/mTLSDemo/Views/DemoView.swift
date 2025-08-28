@@ -411,7 +411,19 @@ struct DemoView: View {
             
         case 3: // Authenticate via mTLS
             await networkService.getClientInfo()
-            let success = networkService.lastResponse?.contains("\"authenticated\": true") ?? false
+            let success: Bool = {
+                if let text = networkService.lastResponse,
+                   let data = text.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let authenticated = json["authenticated"] as? Bool {
+                    return authenticated
+                }
+                // Fallback to a whitespace-agnostic string check for pretty-printed JSON
+                let compact = networkService.lastResponse?
+                    .replacingOccurrences(of: " ", with: "")
+                    .replacingOccurrences(of: "\n", with: "") ?? ""
+                return compact.contains("\"authenticated\":true")
+            }()
             demoSteps[stepIndex].result = success ? "mTLS authentication successful" : "Authentication failed"
             return success
             

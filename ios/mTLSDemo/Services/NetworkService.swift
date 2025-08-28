@@ -58,6 +58,46 @@ public class NetworkService: NSObject, ObservableObject {
     public func downloadCertificate(named name: String) async {
         await performRequest(endpoint: "/api/certificates/download/\(name)", method: "GET")
     }
+
+    /// Enroll a new certificate using CSR
+    public func enrollCertificate(_ enrollmentRequest: EnrollmentRequest) async throws -> Data {
+        guard let url = URL(string: baseURL + "/api/certificates/enroll") else {
+            throw NetworkError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let jsonData = try JSONEncoder().encode(enrollmentRequest)
+        request.httpBody = jsonData
+
+        let (data, response) = try await urlSession.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NetworkError.invalidResponse
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let errorMessage = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw NetworkError.serverError(statusCode: httpResponse.statusCode, message: errorMessage)
+        }
+
+        // Parse JSON response to extract certificate data
+        guard let jsonResponse = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let success = jsonResponse["success"] as? Bool, success,
+              let certificateBase64 = jsonResponse["certificate"] as? String else {
+            throw NetworkError.invalidResponse
+        }
+
+        // Decode the base64 certificate data
+        guard let certificateData = Data(base64Encoded: certificateBase64) else {
+            throw NetworkError.invalidResponse
+        }
+
+        return certificateData
+    }
     
     private func performRequest(endpoint: String, method: String, body: Data? = nil) async {
         guard let url = URL(string: baseURL + endpoint) else {
@@ -337,5 +377,24 @@ extension NetworkService {
         
         print("DEBUG: Successfully loaded CA certificate data, size: \(certData.count) bytes")
         return certData
+    }
+}
+
+// MARK: - Network Errors
+
+public enum NetworkError: Error, LocalizedError {
+    case invalidURL
+    case invalidResponse
+    case serverError(statusCode: Int, message: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidURL:
+            return "Invalid URL"
+        case .invalidResponse:
+            return "Invalid response from server"
+        case .serverError(let statusCode, let message):
+            return "Server error (\(statusCode)): \(message)"
+        }
     }
 }

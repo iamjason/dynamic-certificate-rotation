@@ -3,6 +3,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execSync } = require('child_process');
 
 const app = express();
 const PORT = 8443;
@@ -158,6 +159,86 @@ app.get('/api/certificates/download/:certName', (req, res) => {
   res.sendFile(p12Path);
 });
 
+app.post('/api/certificates/enroll', (req, res) => {
+  try {
+    const { csr, deviceId, commonName } = req.body;
+
+    if (!csr || !deviceId || !commonName) {
+      return res.status(400).json({
+        error: 'Missing required fields: csr, deviceId, commonName'
+      });
+    }
+
+    console.log(`📝 Certificate enrollment request from device: ${deviceId}`);
+    console.log(`📝 Common name: ${commonName}`);
+
+    // Decode the CSR from base64
+    const csrData = Buffer.from(csr, 'base64');
+
+    // Save CSR to temporary file
+    const csrFile = path.join(CERTS_DIR, `csr-${deviceId}-${Date.now()}.csr`);
+    fs.writeFileSync(csrFile, csrData);
+
+    // Generate certificate using OpenSSL
+    const certFile = path.join(CERTS_DIR, `client-${deviceId}-${Date.now()}.pem`);
+    const serialFile = path.join(PKI_DIR, 'certs', 'ca-cert.srl');
+
+    try {
+      // Create certificate signing command
+      const signCommand = [
+        'openssl x509 -req',
+        `-in "${csrFile}"`,
+        `-CA "${path.join(CERTS_DIR, 'ca-cert.pem')}"`,
+        `-CAkey "${path.join(PRIVATE_DIR, 'ca-key.pem')}"`,
+        `-out "${certFile}"`,
+        '-days 365',
+        '-sha256',
+        `-CAserial "${serialFile}"`,
+        '-CAcreateserial'
+      ].join(' ');
+
+      console.log('🔐 Executing certificate signing command...');
+      execSync(signCommand, { stdio: 'inherit' });
+
+      // Read the signed certificate
+      const signedCert = fs.readFileSync(certFile);
+
+      // Clean up temporary files
+      fs.unlinkSync(csrFile);
+      fs.unlinkSync(certFile);
+
+      console.log(`✅ Certificate enrolled successfully for device: ${deviceId}`);
+
+      // Return the signed certificate
+      res.json({
+        success: true,
+        certificate: signedCert.toString('base64'),
+        deviceId: deviceId,
+        commonName: commonName,
+        validFor: '365 days'
+      });
+
+    } catch (signError) {
+      console.error('❌ Certificate signing failed:', signError.message);
+
+      // Clean up temporary files
+      if (fs.existsSync(csrFile)) fs.unlinkSync(csrFile);
+      if (fs.existsSync(certFile)) fs.unlinkSync(certFile);
+
+      return res.status(500).json({
+        error: 'Certificate signing failed',
+        details: signError.message
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Certificate enrollment error:', error.message);
+    res.status(500).json({
+      error: 'Internal server error during certificate enrollment'
+    });
+  }
+});
+
 app.use((err, req, res, next) => {
   console.error('Server error:', err.message);
   res.status(500).json({ error: 'Internal server error' });
@@ -192,6 +273,7 @@ server.listen(PORT, () => {
   console.log('  GET /api/secure-data                  - Protected data');
   console.log('  GET /api/certificates/current         - Current certificate status');
   console.log('  GET /api/certificates/download/:name  - Download certificate bundle');
+  console.log('  POST /api/certificates/enroll         - Enroll new certificate');
   console.log('');
   console.log('🧪 Test with curl:');
   console.log(`  curl --cert ${CERTS_DIR}/ios-client-v1-cert.pem \\`);
