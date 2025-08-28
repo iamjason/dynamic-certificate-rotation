@@ -1,0 +1,25 @@
+{
+  "name": "mtls-demo-server",
+  "version": "1.0.0",
+  "description": "mTLS Demo Server with Dynamic Certificate Rotation",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "mtls",
+    "mutual-tls",
+    "certificates",
+    "node",
+    "https"
+  ],
+  "author": "mTLS Demo",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
